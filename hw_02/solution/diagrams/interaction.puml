@@ -1,0 +1,58 @@
+@startuml interaction
+title Сервис бронирования (аналог Booking) — взаимодействие сервисов
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam ArrowFontSize 11
+skinparam wrapWidth 200
+
+actor "Клиент\n(web / mobile)" as Client
+
+node "API Gateway / BFF\n(GraphQL + REST)" as BFF
+
+package "Синхронный путь (команды)" {
+  component "Search Service\n(поиск, каталог)" as Search
+  component "Booking Service\n(оркестратор Saga)" as Booking
+  component "Inventory / Availability\n(холды, календарь)" as Inventory
+  component "Pricing Service\n(цены, промо)" as Pricing
+  component "Payment Service\n(PSP, возвраты)" as Payment
+  component "User / Identity\n(профили, auth)" as User
+  component "Notification Service\n(email/SMS/push)" as Notify
+}
+
+queue "Message Broker (Kafka)\nевенты домена" as Kafka
+database "Search Read Model\n(Elasticsearch)" as ES
+cloud "PSP\n(эквайринг)" as PSP
+
+' --- Клиент -> BFF ---
+Client -down-> BFF : **GraphQL** (чтение/агрегация)\n**REST** (команды: create/cancel)
+Client <.up. BFF : **SSE** статус брони (progress)
+
+' --- BFF -> сервисы ---
+BFF -down-> Search : **gRPC**
+BFF -down-> Booking : **gRPC**
+BFF -down-> User : **gRPC**
+
+' --- Booking Saga (sync) ---
+Booking -right-> Inventory : **gRPC** CheckAvailability / CreateHold
+Booking -down-> Pricing : **gRPC** Quote
+Booking -down-> Payment : **gRPC** Authorize / Capture / Refund
+Payment <-down-> PSP : **REST / webhook** (async результат)
+
+Search -down-> ES : query (REST)
+
+' --- События (async, Kafka) ---
+Booking .down.> Kafka : BookingCreated / Confirmed / Cancelled
+Payment .down.> Kafka : PaymentAuthorized / Failed / Refunded
+Inventory .down.> Kafka : InventoryHeld / Released / RateChanged
+Kafka .up.> Notify : events (подтверждения, напоминания)
+Kafka .up.> Search : events (реиндексация каталога)
+Kafka .up.> Booking : PaymentAuthorized/Failed (продолжение Saga)
+
+legend right
+  Сплошная = синхронный вызов (request/response)
+  Пунктир  = асинхронное событие (pub/sub)
+endlegend
+
+@enduml
