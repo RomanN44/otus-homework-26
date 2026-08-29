@@ -1,0 +1,234 @@
+@startuml data-model
+title Сервис бронирования отелей — модель данных по сервисам (bounded contexts)
+
+hide circle
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam linetype ortho
+
+package "User / Identity  (PostgreSQL + Redis)" #F4F8FF {
+  entity "users" as users {
+    * user_id : UUID <<PK>>
+    --
+    email : citext <<UQ>>
+    phone : text
+    password_hash : text
+    locale, currency : text
+    created_at : timestamptz
+  }
+  entity "user_profile" as uprof {
+    * user_id : UUID <<PK,FK>>
+    --
+    first_name, last_name : text
+    loyalty_tier : text
+    preferences : jsonb
+  }
+  entity "session (Redis)" as sess {
+    * key: sess:TOKEN <<TTL 30d>>
+    --
+    user_id, device, scopes
+  }
+  users ||--|| uprof
+  users ||--o{ sess
+}
+
+package "Search read-model  (Elasticsearch + S3/CDN)" #FFF8F0 {
+  entity "hotel_doc (denormalized)" as hdoc {
+    * _id = hotel_id
+    --
+    name, description : text (analyzed)
+    geo : geo_point
+    city_id, country : keyword
+    amenities : keyword[]
+    rating, reviews_count : float/int
+    min_price_by_date : nested[date, price]
+    room_types : nested[id, title, capacity]
+    photos : uri[] (ссылки на S3/CDN)
+    updated_at : date
+  }
+  note bottom of hdoc
+    Read-model (CQRS). Наполняется событиями
+    HotelUpdated / RateChanged / InventoryChanged.
+    Источник истины — Inventory и Pricing.
+  end note
+}
+
+package "Inventory / Availability  (PostgreSQL, шардирован по hotel_id)" #F3FFF3 {
+  entity "hotels" as hotels {
+    * hotel_id : UUID <<PK, shard key>>
+    --
+    partner_id, city_id, geo, address
+    status : text
+  }
+  entity "room_types" as rtypes {
+    * room_type_id : UUID <<PK>>
+    --
+    hotel_id : UUID <<FK, shard key>>
+    title, capacity, total_rooms : int
+  }
+  entity "availability_calendar" as cal {
+    * (hotel_id, room_type_id, date) <<PK>>
+    --
+    total : smallint
+    booked : smallint
+    held : smallint
+    closed : bool
+    version : bigint  -- optimistic lock
+  }
+  entity "holds" as holds {
+    * hold_id : UUID <<PK>>
+    --
+    hotel_id <<shard key>>, room_type_id
+    check_in, check_out : date
+    rooms : smallint
+    status : HELD|COMMITTED|RELEASED|EXPIRED
+    idempotency_key : text <<UQ>>
+    expires_at : timestamptz  -- индекс для sweeper
+  }
+  entity "outbox (inventory)" as inv_outbox {
+    * event_id : UUID <<PK>>
+    --
+    aggregate_id, type, payload : jsonb
+    published_at : timestamptz
+  }
+  hotels ||--o{ rtypes
+  rtypes ||--o{ cal
+  rtypes ||--o{ holds
+}
+
+package "Booking  (PostgreSQL, шардирован по user_id)" #FFF3F8 {
+  entity "bookings" as bk {
+    * booking_id : ULID <<PK>> (префикс = shard)
+    --
+    user_id : UUID <<shard key>>
+    hotel_id, room_type_id : UUID
+    check_in, check_out : date
+    guests : jsonb
+    status : PENDING_PAYMENT|CONFIRMED|CANCELLED|FAILED
+    total_price : numeric, currency
+    hold_id, payment_id : UUID
+    idempotency_key : text <<UQ>>
+    created_at, updated_at
+  }
+  entity "booking_state_log" as blog {
+    * (booking_id, seq) <<PK>>
+    --
+    from_state, to_state, reason, at
+  }
+  entity "saga_instance" as saga {
+    * saga_id : UUID <<PK>>
+    --
+    booking_id <<FK>>, step, compensations : jsonb
+    status, retry_count, next_retry_at
+  }
+  entity "outbox (booking)" as bk_outbox {
+    * event_id : UUID <<PK>>
+    --
+    booking_id, type, payload : jsonb
+  }
+  bk ||--o{ blog
+  bk ||--|| saga
+  bk ||--o{ bk_outbox
+}
+
+package "Pricing  (ScyllaDB/Cassandra + PostgreSQL)" #FFFDF0 {
+  entity "rate_calendar (Scylla)" as rate {
+    * PK ((hotel_id, rate_plan_id), date)
+    --
+    base_price : decimal
+    currency : text
+    min_stay, closed_to_arrival : int/bool
+    updated_at : timeuuid
+  }
+  entity "rate_plans / promo (PostgreSQL)" as plans {
+    * rate_plan_id : UUID <<PK>>
+    --
+    hotel_id, name, refundable : bool
+    cancellation_policy : jsonb
+    promo_code, discount, valid_from/to
+  }
+  entity "quote (Redis)" as quote {
+    * key: quote:HASH <<TTL 5m>>
+    --
+    breakdown, total, currency
+  }
+  plans ||--o{ rate
+}
+
+package "Payment  (PostgreSQL, PCI-контур)" #F0F4FF {
+  entity "payments" as pay {
+    * payment_id : UUID <<PK>>
+    --
+    booking_id : UUID <<UQ>>
+    amount : numeric, currency
+    status : AUTHORIZED|CAPTURED|FAILED|REFUNDED
+    psp_ref : text
+    idempotency_key : text <<UQ>>
+  }
+  entity "payment_attempts" as att {
+    * attempt_id : UUID <<PK>>
+    --
+    payment_id <<FK>>, psp_request/response : jsonb
+    code, at
+  }
+  entity "refunds" as ref {
+    * refund_id : UUID <<PK>>
+    --
+    payment_id <<FK>>, amount, reason, status
+  }
+  entity "payment_tokens" as tok {
+    * token_id : UUID <<PK>>
+    --
+    user_id, psp_token (карта НЕ хранится), last4, brand
+  }
+  pay ||--o{ att
+  pay ||--o{ ref
+}
+
+package "Notification  (ScyllaDB + S3)" #F7F0FF {
+  entity "delivery_log (Scylla)" as dlog {
+    * PK ((user_id), sent_at DESC, message_id)
+    --
+    channel : EMAIL|SMS|PUSH
+    template_id, status, provider_ref
+    TTL 180 дней
+  }
+  entity "templates (S3 / config)" as tpl {
+    template_id, locale, subject, body
+  }
+  entity "dedup (Redis)" as ddp {
+    * key: notif:EVENT_ID <<TTL 24h>>
+  }
+}
+
+package "Analytics / Audit  (ClickHouse)" #F5F5F5 {
+  entity "events_wide" as ev {
+    event_time, event_type, user_id,
+    hotel_id, city_id, booking_id,
+    amount, ab_bucket, raw : String
+    PARTITION BY toYYYYMM(event_time)
+    ORDER BY (event_type, event_time)
+  }
+  entity "bookings_by_hotel (MV)" as mvbh {
+    hotel_id, date, bookings, revenue
+    read-model для партнёров (cross-shard обход)
+  }
+}
+
+' --- связи между контекстами (по id, без FK) ---
+bk ..> holds : hold_id (gRPC)
+bk ..> pay : payment_id (gRPC)
+bk ..> rate : quote (gRPC)
+hdoc <.. cal : события InventoryChanged
+hdoc <.. rate : события RateChanged
+dlog <.. bk : события BookingConfirmed/Cancelled
+ev <.. bk : CDC / Kafka
+users <.. bk : user_id (без FK, разные БД)
+
+legend right
+  Сплошные линии — связи внутри одного хранилища (FK/PK).
+  Пунктир — связь между сервисами по идентификатору:
+  внешних ключей между БД сервисов нет.
+endlegend
+
+@enduml

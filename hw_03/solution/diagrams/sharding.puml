@@ -1,0 +1,75 @@
+@startuml sharding
+title Шардирование Inventory (hotel_id) и Booking (user_id) через логические бакеты
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam componentStyle rectangle
+
+actor "Клиент" as C
+component "API Gateway / BFF" as BFF
+
+package "Read-path (не ходит в шарды)" #FFF8F0 {
+  database "Elasticsearch\nread-model каталога" as ES
+  component "Search Service" as Search
+}
+
+package "Booking Service" #FFF3F8 {
+  component "Shard router\nbucket = crc32(user_id) % 1024\nnode  = lookup[bucket]" as BRouter
+  database "BK shard 0\nbuckets 0..511" as BK0
+  database "BK shard 1\nbuckets 512..1023" as BK1
+}
+
+package "Inventory Service" #F3FFF3 {
+  component "Shard router\nbucket = crc32(hotel_id) % 1024\nnode  = lookup[bucket]" as IRouter
+  database "INV shard 0\nbuckets 0..127\n+ 2 read-реплики" as I0
+  database "INV shard 1\nbuckets 128..255" as I1
+  database "INV shard 2\nbuckets 256..383" as I2
+  database "INV shard ...\n(всего 8)" as I3
+}
+
+database "Redis\nlookup-таблица\nbucket -> node\n(источник: etcd)" as LOOKUP
+
+C --> BFF
+BFF --> Search : поиск по городу/датам
+Search --> ES : scatter-gather ПО ИНДЕКСУ ES,\nа не по шардам Inventory
+
+BFF --> BRouter : POST /v1/bookings (есть user_id)
+BRouter --> BK0
+BRouter --> BK1
+
+BRouter --> IRouter : CreateHold(hotel_id, ...)
+IRouter --> I0
+IRouter --> I1
+IRouter --> I2
+IRouter --> I3
+
+IRouter ..> LOOKUP : читает карту бакетов
+BRouter ..> LOOKUP
+
+note right of I0
+  Внутри шарда — секционирование
+  availability_calendar по месяцу:
+  PARTITION BY RANGE (date)
+  => старые месяцы DETACH + архив
+end note
+
+note right of BK0
+  booking_id = base62(bucket) + ULID
+  => по booking_id шард вычисляется
+  без обращения к lookup
+end note
+
+note bottom of LOOKUP
+  Ребалансировка: переезжает целый бакет
+  (логическая репликация -> switch записи -> удаление).
+  Добавление 9-й ноды = переезд ~11% бакетов,
+  ключ шардирования при этом НЕ меняется.
+end note
+
+legend right
+  Ключ Inventory: hotel_id — весь холд по отелю в одной транзакции одного шарда.
+  Ключ Booking: user_id — «мои брони» = один шард; запрос «брони отеля»
+  обслуживает read-model в ClickHouse, а не scatter-gather по шардам.
+endlegend
+
+@enduml
