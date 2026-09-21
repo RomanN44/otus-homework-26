@@ -1,12 +1,8 @@
 @startuml telemetry_architecture
 
-!define AWSPUML https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v14.0/dist
-!include AWSPUML/ApplicationIntegration/APIGateway.puml
-!include AWSPUML/Storage/SimpleStorageService.puml
-!include AWSPUML/Database/RelationalDatabaseService.puml
-
 skinparam linetype ortho
 skinparam backgroundColor #FEFEFE
+skinparam componentStyle uml2
 
 package "Mobile Apps" {
   component "iOS SDK" as ios_sdk
