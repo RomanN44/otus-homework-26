@@ -1,0 +1,74 @@
+@startuml replication
+title Схема репликации критичных хранилищ
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam ArrowFontSize 11
+skinparam nodesep 25
+skinparam ranksep 40
+skinparam packageStyle rectangle
+
+package "Регион ru-central (основной), 3 зоны доступности" as MAIN {
+
+  component "HAProxy / PgBouncer\n(виртуальный адрес)" as HA
+
+  package "PostgreSQL — отдельный кластер у Booking / Inventory / Payment / User" as PG {
+    database "primary\nAZ-A" as PgA
+    database "sync standby\nAZ-B" as PgB
+    database "async replica\nAZ-C\n(чтения с отставанием, бэкапы)" as PgC
+    component "etcd: 5 узлов по 3 зонам\nDCS для Patroni, leader lock, ttl=30 c" as ETCD
+  }
+
+  package "Kafka: RF=3, min.insync.replicas=2, acks=all" as KF {
+    component "broker 1\nrack=AZ-A" as K1
+    component "broker 2\nrack=AZ-B" as K2
+    component "broker 3\nrack=AZ-C" as K3
+  }
+
+  package "Elasticsearch (read-model поиска)\n1 primary + 1 replica shard, awareness по зоне" as ESC {
+    database "data node 1\nAZ-A" as ES1
+    database "data node 2\nAZ-B" as ES2
+    database "data node 3\nAZ-C" as ES3
+  }
+}
+
+cloud "Объектное хранилище (доступно из обоих регионов)\npgBackRest: full 1/сут, incr 1/6 ч,\nнепрерывный архив WAL, шифрование своим ключом" as S3
+
+package "Регион ru-west (DR, warm standby)" as DRP {
+  database "PostgreSQL DR replica\nnofailover=true" as PgDR
+  component "Kafka DR" as KDR
+  component "Сервисы: по 1 реплике,\nобразы прогреты" as SvcDR
+}
+
+HA --> PgA : запись и\nконсистентные чтения
+HA --> PgC : чтения\nс отставанием
+
+PgA --> PgB : streaming, синхронно\nsynchronous_commit=remote_write\nANY 1 -> RPO=0
+PgA --> PgC : streaming,\nасинхронно
+PgA .[#gray].> ETCD : leader lock
+PgB .[#gray].> ETCD
+
+PgA --> S3 : непрерывный\nархив WAL
+K2 --> KDR : MirrorMaker 2, async,\nтрансляция офсетов
+PgC --> PgDR : каскадная асинхронная\nрепликация, RPO до 60 с
+S3 --> PgDR : восстановление\nи PITR
+
+K1 -[hidden]right- K2
+K2 -[hidden]right- K3
+ES1 -[hidden]right- ES2
+ES2 -[hidden]right- ES3
+PgDR -[hidden]right- KDR
+KDR -[hidden]right- SvcDR
+KF -[hidden]right- ESC
+
+
+
+legend bottom
+  Failover внутри региона — автоматический (Patroni, 20–40 с). Между регионами — только ручной
+  промоут по решению incident commander: защита от split-brain, то есть от овербукинга.
+  В DR-регионе Elasticsearch не реплицируется: read-model пересобирается переигрыванием Kafka
+  и переиндексацией из Inventory / Pricing — RTO 30 мин.
+endlegend
+
+@enduml
