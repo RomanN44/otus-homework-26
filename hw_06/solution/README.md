@@ -53,45 +53,45 @@
 ### Диаграмма контейнеров
 
 ```
-┌──────────────────────────────────────────────────────┐
-│             Telemetry System                         │
-├──────────────────────────────────────────────────────┤
-│                                                      │
-│  [SDK] ──HTTP/2──> [API Gateway]                   │
-│                          │                           │
-│                          v                           │
-│                    ┌─────────────┐                   │
-│                    │ Kafka Queue │ (topics:          │
-│                    │ - crashes   │ crashes, logs,    │
-│                    │ - logs      │ perf, battery)    │
-│                    │ - perf      │                   │
-│                    │ - battery   │                   │
-│                    └──────┬──────┘                   │
-│                           │                           │
-│        ┌──────────────────┼──────────────────┐      │
-│        │                  │                  │      │
-│        v                  v                  v      │
-│   ┌────────┐         ┌─────────┐       ┌────────┐ │
-│   │Processor│        │Indexer  │       │Archiver│ │
-│   │dedup    │        │(search) │       │(cold)  │ │
-│   │enrich   │        │         │       │        │ │
-│   └────┬───┘         └────┬────┘       └──┬─────┘ │
-│        │                  │               │       │
-│        v                  v               v       │
-│   [Postgres]      [Elasticsearch]    [S3]        │
-│   (30 дн)         (30 дн, search)  (1 год)      │
-│                                              │
-│   ┌──────────┐           ┌──────────────┐   │
-│   │Aggregator│─────────> │ClickHouse    │   │
-│   │          │           │ (analytics)  │   │
-│   └──────────┘           └──────────────┘   │
-│                                              │
-│   ┌──────────────────────────────────────┐  │
-│   │ Dashboards + Alert Manager           │  │
-│   │ (REST API + WebSocket)               │  │
-│   └──────────────────────────────────────┘  │
-│                                              │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│              Telemetry System                      │
+├────────────────────────────────────────────────────┤
+│                                                    │
+│  [SDK] ──HTTP/2──> [API Gateway]                 │
+│                          │                         │
+│                          v                         │
+│                   ┌──────────────┐                 │
+│                   │ Kafka Queue  │ (topics:        │
+│                   │ - crashes    │  crashes,       │
+│                   │ - logs       │  logs, perf,    │
+│                   │ - perf       │  battery)       │
+│                   │ - battery    │                 │
+│                   └──────┬───────┘                 │
+│                          │                         │
+│     ┌────────────────────┼────────────────────┐   │
+│     │                    │                    │   │
+│     v                    v                    v   │
+│  ┌────────┐       ┌──────────┐          ┌────────┐│
+│  │Processor│       │ Indexer  │          │Archiver││
+│  │ dedup   │       │(search)  │          │(cold)  ││
+│  │ enrich  │       │          │          │        ││
+│  └────┬───┘        └────┬─────┘          └───┬────┘│
+│       │                 │                    │     │
+│       v                 v                    v     │
+│  [Postgres]     [Elasticsearch]          [S3]     │
+│  (30 дн)        (30 дн, search)      (1 год)     │
+│                                                    │
+│   ┌──────────┐         ┌──────────────┐           │
+│   │Aggregator├────────>│ ClickHouse   │           │
+│   │          │         │ (analytics)  │           │
+│   └──────────┘         └──────────────┘           │
+│                                                    │
+│   ┌────────────────────────────────────────┐      │
+│   │ Dashboards + Alert Manager             │      │
+│   │ (REST API + WebSocket)                 │      │
+│   └────────────────────────────────────────┘      │
+│                                                    │
+└────────────────────────────────────────────────────┘
 ```
 
 ### Компоненты
@@ -269,22 +269,20 @@ s3://telemetry-archive/2025-08/app_id=com.example.app/events.parquet
 SDK [batch, offline buffer]
   │ HTTP/2 POST /api/v1/ingest
   v
-[API Gateway] ──rate limit─┐
-  │                         v Kafka [publish]
-  ├──────────────────────────────────────┐
-  │                                      v
+[API Gateway] ──rate limit──> Kafka [publish]
+  │
   ├──> Processor ──> Postgres [hot]
   │    (dedup,enrich,sample)
   │
   ├──> Indexer ──> Elasticsearch [search]
   │
   └──> Archiver ──> S3 [cold]
-  
-  ┌──────────────────┐
-  │ Aggregator ──────> ClickHouse [agg]
-  └──────────────────┘
-  
-  REST API <─ Dashboards / Alert Manager
+
+Kafka
+  │
+  └──> Aggregator ──> ClickHouse [agg]
+
+REST API <─── Dashboards / Alert Manager
 ```
 
 ### Выбор протоколов
