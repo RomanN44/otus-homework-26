@@ -1,0 +1,60 @@
+@startuml telemetry_architecture
+
+!define AWSPUML https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v14.0/dist
+!include AWSPUML/ApplicationIntegration/APIGateway.puml
+!include AWSPUML/Storage/SimpleStorageService.puml
+!include AWSPUML/Database/RelationalDatabaseService.puml
+
+skinparam linetype ortho
+skinparam backgroundColor #FEFEFE
+
+package "Mobile Apps" {
+  component "iOS SDK" as ios_sdk
+  component "Android SDK" as android_sdk
+}
+
+package "Telemetry System" {
+  component "API Gateway\n(HTTP/2, rate limit)" as api_gw
+  
+  component "Kafka\n(topics: crashes, logs, perf, battery)" as kafka
+  
+  component "Processor\n(dedup, enrich)" as processor
+  component "Indexer\n(text search)" as indexer
+  component "Archiver\n(to S3)" as archiver
+  component "Aggregator\n(timeseries)" as aggregator
+  
+  component "PostgreSQL\n(hot, 30 days)" as pg_hot
+  component "ClickHouse\n(analytics)" as ch_agg
+  component "Elasticsearch\n(search)" as es_search
+  component "S3\n(cold, 1 year)" as s3_cold
+  component "Redis\n(dedup cache)" as redis_cache
+  
+  component "Dashboards" as dashboards
+  component "Alert Manager" as alert_mgr
+}
+
+ios_sdk --> api_gw : HTTP/2 batch
+android_sdk --> api_gw : HTTP/2 batch
+
+api_gw --> kafka : publish event
+kafka --> processor : consume
+kafka --> indexer : consume
+kafka --> archiver : consume
+kafka --> aggregator : consume
+
+processor --> pg_hot : write
+processor --> redis_cache : cache
+
+indexer --> es_search : index
+
+archiver --> s3_cold : upload
+
+aggregator --> ch_agg : aggregate
+
+dashboards -.-> pg_hot : query
+dashboards -.-> es_search : search
+dashboards -.-> ch_agg : analytics
+
+alert_mgr -.-> ch_agg : rules
+
+@enduml

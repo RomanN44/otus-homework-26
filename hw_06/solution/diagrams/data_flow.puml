@@ -1,0 +1,87 @@
+@startuml telemetry_data_flow
+
+skinparam linetype ortho
+skinparam backgroundColor #FEFEFE
+
+actor "Mobile App" as app
+
+participant "API Gateway" as gw
+queue "Kafka\nEvent Buffer" as kafka
+participant "Processor" as proc
+participant "Indexer" as indexer
+participant "Archiver" as archiver
+participant "Aggregator" as agg
+
+database "PostgreSQL\n(hot, 30d)" as pg
+database "Elasticsearch\n(search, 30d)" as es
+database "ClickHouse\n(analytics, 30d)" as ch
+cloud "S3\n(cold, 1y)" as s3
+
+== Ingestion Flow ==
+app -> gw: HTTP/2 POST /ingest\n(batch events, gzip)
+activate gw
+gw -> gw: validate auth\nrate limit
+alt Rate Limited
+  gw --> app: 429 Too Many Requests
+else OK
+  gw -> kafka: publish(event_batch)
+  gw --> app: 202 Accepted (async)
+end
+deactivate gw
+
+== Processing Flow ==
+kafka -> proc: consume event
+activate proc
+proc -> proc: dedup by stacktrace\nenrich (GeoIP)\nsample by importance
+proc -> pg: INSERT events
+proc -> proc: cache dedup hashes\nto Redis (1h TTL)
+deactivate proc
+
+== Indexing Flow ==
+kafka -> indexer: consume event
+activate indexer
+indexer -> indexer: extract text\nparse stacktrace
+indexer -> es: index document
+deactivate indexer
+
+== Archiving Flow ==
+kafka -> archiver: consume event
+activate archiver
+archiver -> archiver: buffer 1 month\ncompress parquet
+archiver -> s3: PUT monthly.parquet
+deactivate archiver
+
+== Analytics Flow ==
+kafka -> agg: consume event
+activate agg
+agg -> agg: count, aggregate\nby version, os_type, country
+agg -> ch: INSERT agg row
+deactivate agg
+
+== Query Flow ==
+app -> gw: HTTP/1.1 GET /analytics/query
+activate gw
+gw -> ch: SELECT crashes\ntrend, topErrors
+gw <-- ch: result set
+gw --> app: 200 OK (JSON)
+deactivate gw
+
+== Search Flow ==
+app -> gw: HTTP/1.1 GET /crashes/search?query=NullPointerException
+activate gw
+gw -> es: _search?q=...
+gw <-- es: hits
+gw --> app: 200 OK (JSON)
+deactivate gw
+
+== Retention Flow ==
+note right of s3
+**Retention Policy:**
+- PostgreSQL: partitions older than 30d archived to S3
+- Elasticsearch: indices > 30d deleted
+- ClickHouse: TTL 30 days
+- S3: WORM, retention 1 year
+- Compliance: GDPR deletion via batch job
+end note
+
+@enduml
