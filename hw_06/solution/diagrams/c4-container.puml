@@ -1,0 +1,110 @@
+@startuml c4-container
+title C4 уровень 2 (Container) — платформа телеметрии. Разделение на write path / processing / read path / control plane
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 11
+skinparam componentStyle rectangle
+skinparam nodesep 25
+skinparam ranksep 45
+
+actor "Мобильное\nприложение\n(SDK)" as SDK
+actor "Аналитик\nклиента" as AN
+actor "Владелец\nаккаунта" as OWN
+actor "CI клиента" as CI
+
+package "Edge" #F7F9FC {
+  component "**CDN + Anycast LB**\n<size:10>TLS 1.3, терминация у края,\nстатика Web UI" as EDGE
+}
+
+package "Write path — приём (stateless, масштабируется горизонтально)" #EAF3EA {
+  component "**Ingest Gateway**\n<size:10>Go. Принимает батчи, проверяет app key\nпо локальному кэшу, режет IP до /24,\nсчитает квоту, кладёт в Kafka.\nБольше не делает НИЧЕГО." as ING
+  component "**Crash Ingest**\n<size:10>Приём отчётов о сбоях и ANR,\nзагрузка dSYM / mapping в S3" as CRIN
+}
+
+package "Шина событий" #FFF6E8 {
+  queue "**Kafka**\n<size:10>topic events.raw.v1 — 96 партиций, RF=3,\nacks=all, min.insync=2, retention 72 ч.\nКлюч = app_id:device_bucket" as KAFKA
+  component "**Kafka Connect → S3**\n<size:10>непрерывный архив сырого потока" as KC
+}
+
+package "Processing — потоковая обработка (Kappa)" #EFEAF7 {
+  component "**Enrichment Job** (Flink)\n<size:10>дедуп по (device_id, seq_no) в RocksDB,\nGeoIP, разбор User-Agent, сессионизация,\nвалидация схемы, карантин кардинальности" as ENR
+  component "**Realtime Aggregator** (Flink)\n<size:10>поминутные счётчики последнего часа" as RT
+  component "**ClickHouse Writer**\n<size:10>микробатчи 100 тыс. строк / 10 с" as CHW
+  component "**Crash Processor**\n<size:10>символикация стектрейсов,\nгруппировка в issues по сигнатуре" as CRP
+}
+
+package "Хранилища" #FDECEC {
+  database "**ClickHouse**\n<size:10>6 шардов x RF2. events (детали 30 дней NVMe,\n31–90 дней S3-диск), MV-агрегаты 3 года,\nuser_profiles, crash_events" as CH
+  database "**PostgreSQL**\n<size:10>tenants, apps, api_keys, пользователи,\nквоты, каталог событий, crash issues" as PG
+  database "**Redis**\n<size:10>кэш результатов, счётчики квот,\nrate limit, метаданные ключей" as REDIS
+  cloud "**Object Storage (S3)**\n<size:10>raw archive 30 дней, warm-партиции CH,\ndSYM / mapping, выгрузки клиентам" as S3
+}
+
+package "Read path — аналитика" #EAF0FA {
+  component "**Query API**\n<size:10>Query DSL → SQL, выбор источника\n(агрегаты vs детали), лимиты памяти,\nасинхронные долгие запросы" as QAPI
+  component "**Web UI (SPA)**\n<size:10>дашборды, воронки, ретеншн,\nразбор сбоев" as UI
+  component "**Export Service**\n<size:10>выгрузка сырых событий в S3 клиента,\nвебхуки о готовности" as EXP
+}
+
+package "Control plane" #F0F0F0 {
+  component "**Tenant / Auth Service**\n<size:10>приложения, API-ключи, участники,\nRBAC, OIDC + SSO, тарифы и квоты" as TEN
+  component "**Schema Registry**\n<size:10>реестр типов событий и свойств,\nконтроль обратной совместимости" as SR
+  component "**Retention / GDPR Worker**\n<size:10>TTL-политики, удаление данных\nпо запросу субъекта" as RET
+}
+
+SDK --> EDGE : POST /v1/events (батч)
+SDK --> EDGE : POST /v1/crashes
+CI --> EDGE : POST /v1/symbols
+AN --> EDGE : Web UI / Public API
+OWN -[hidden]-> AN
+OWN --> EDGE : управление аккаунтом
+
+EDGE --> ING
+EDGE --> CRIN
+EDGE --> UI
+
+ING --> KAFKA : produce
+CRIN --> KAFKA : produce
+ING ..> REDIS : квоты, rate limit
+ING ..> TEN : gRPC ResolveApiKey\n<size:9>кэш 60 с, fail-open 1 ч
+
+KAFKA --> ENR
+KAFKA --> KC
+KC --> S3 : raw archive
+ENR --> KAFKA : events.enriched.v1
+KAFKA --> RT
+KAFKA --> CHW
+KAFKA --> CRP
+RT --> REDIS : realtime-счётчики
+CHW --> CH : native INSERT
+CRP --> CH : crash_events
+CRP --> PG : issues
+
+QAPI --> CH : SQL
+QAPI --> REDIS : кэш результатов
+QAPI ..> TEN : проверка прав на app_id
+UI --> QAPI
+EXP --> CH
+
+TEN --> PG
+SR --> PG
+RET --> CH : lightweight DELETE
+RET --> PG
+CH <--> S3 : storage policy\nhot NVMe → cold S3
+
+legend right
+  Сплошные стрелки — основной поток данных и синхронные вызовы.
+  Пунктир — вспомогательные и метаданные.
+
+  |= Плоскость |= Свойство |
+  | Write path | должен работать всегда; при отказе всего остального события не теряются |
+  | Processing | можно остановить и переиграть из Kafka или S3 |
+  | Read path | допускает отставание и деградацию |
+  | Control plane | мал по объёму, но нужна строгая консистентность |
+
+  Единственное место со строгой консистентностью — PostgreSQL control plane.
+  Весь путь данных — eventual consistency + at-least-once.
+endlegend
+
+@enduml
