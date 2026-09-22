@@ -1,0 +1,98 @@
+@startuml interaction
+title Взаимодействие сервисов: приём события, аналитический запрос, обработка сбоя
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 11
+skinparam sequenceMessageAlign direction
+skinparam ParticipantPadding 8
+skinparam BoxPadding 10
+
+participant "SDK\n(устройство)" as SDK
+box "Write path" #EAF3EA
+participant "Ingest\nGateway" as ING
+participant "Tenant\nService" as TEN
+end box
+queue "Kafka" as K
+box "Processing" #EFEAF7
+participant "Enrichment\n(Flink)" as ENR
+participant "CH Writer" as CHW
+participant "Crash\nProcessor" as CRP
+end box
+database "ClickHouse" as CH
+database "Redis" as R
+box "Read path" #EAF0FA
+participant "Query API" as Q
+end box
+actor "Аналитик" as AN
+
+== A. Приём события (горячий путь, 104 тыс. событий/с на пике) ==
+
+SDK -> SDK : буфер в SQLite,\nбатч 20 событий или 30 с,\nsdk_seq_no++ на каждое
+SDK -> ING : **POST /v1/events**\nHTTPS, JSON+gzip, X-Api-Key
+activate ING
+ING -> ING : поиск ключа в локальном кэше (60 с)
+alt промах кэша
+  ING -> TEN : gRPC ResolveApiKey
+  TEN --> ING : app_id, план, лимиты
+end
+ING -> R : INCR квоты и rate limit
+alt квота исчерпана
+  R --> ING : превышение
+  ING --> SDK : **429** + Retry-After
+  note right of SDK : SDK не удаляет батч,\nповторит с backoff
+end
+ING -> ING : IP → /24, отбрасывание\nзапрещённых свойств
+ING -> K : produce(events.raw.v1)\nключ = app_id:device_bucket\nacks=all
+K --> ING : ack
+ING --> SDK : **202 Accepted**\n<size:10>p99 ≤ 200 мс
+deactivate ING
+SDK -> SDK : удалить батч из буфера
+note over SDK, ING
+  Подтверждение означает «событие в Kafka», а не «событие в отчёте».
+  Всё, что дальше, — асинхронно и может быть переиграно.
+end note
+
+K -> ENR : consume
+activate ENR
+ENR -> ENR : дедуп по (device_id, sdk_seq_no)\nсостояние в RocksDB, окно 24 ч
+ENR -> ENR : GeoIP, разбор UA,\nсессионизация, схема
+ENR -> K : produce(events.enriched.v1)
+deactivate ENR
+K -> CHW : consume
+CHW -> CH : native INSERT\nмикробатч 100 тыс. строк / 10 с
+note right of CH : Материализованные представления\nобновляют суточные агрегаты\nсинхронно со вставкой
+
+== B. Аналитический запрос (20 RPS на пике) ==
+
+AN -> Q : **POST /v2/query** (Query DSL)\nBearer JWT
+activate Q
+Q -> Q : app_id берётся ИЗ ТОКЕНА,\nа не из тела запроса
+Q -> R : GET кэш результата
+alt попадание
+  R --> Q : результат
+  Q --> AN : 200 OK (из кэша)
+else промах
+  Q -> Q : выбор источника:\nагрегаты (быстро) или детали (точно)
+  Q -> CH : SQL, max_execution_time,\nmax_memory_usage
+  CH --> Q : строки
+  Q -> R : SET результат,\nTTL 60 с (сегодня) / 24 ч (закрытые сутки)
+  Q --> AN : 200 OK
+end
+deactivate Q
+note over Q : Запрос дольше 10 с переводится\nв асинхронный режим: 202 + query_id,\nрезультат забирается по GET или SSE
+
+== C. Обработка сбоя ==
+
+SDK -> ING : POST /v1/crashes\n(стектрейс + breadcrumbs)
+ING -> K : produce(crashes.raw.v1)
+K -> CRP : consume
+activate CRP
+CRP -> CRP : символикация по dSYM/mapping из S3
+CRP -> CRP : сигнатура группы = хэш\nнормализованного верха стека
+CRP -> CH : crash_events (экземпляр)
+CRP -> K : produce(crash.issue.created)\nесли группа новая
+deactivate CRP
+note right of CRP : Вебхук клиенту (Slack/Telegram)\nотправляет отдельный подписчик,\nне блокируя обработку
+
+@enduml

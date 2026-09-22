@@ -1,0 +1,76 @@
+@startuml reliability
+title Репликация и план DR: приём active-active по регионам, аналитика active-passive
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 11
+skinparam componentStyle rectangle
+
+actor "SDK\n<size:10>буфер на устройстве до 7 суток" as SDK
+component "**GSLB / Anycast**\n<size:10>health-check приёма, TTL DNS 60 с" as GSLB
+
+package "Основной регион  ru-central (3 зоны)" #EAF3EA {
+  component "Ingest Gateway\n<size:10>9 подов, 3 зоны" as ING1
+  queue "**Kafka**\n<size:10>6 брокеров, broker.rack = зона\nRF=3, min.insync=2, acks=all\nretention 72 ч" as K1
+  component "Flink\n<size:10>checkpoint 30 с в S3,\noffsets в Kafka" as F1
+  database "**ClickHouse** 6 шардов x RF2\n<size:10>реплики шарда в разных зонах,\nкоординация через Keeper (3 узла)" as CH1
+  database "**PostgreSQL** control plane\n<size:10>primary AZ-A + sync-standby AZ-B\n+ async AZ-C, Patroni + etcd" as PG1
+  component "Kafka Connect → S3" as KC1
+}
+
+package "Резервный регион  ru-west (warm standby)" #EAF0FA {
+  component "Ingest Gateway\n<size:10>2 пода, прогреты,\nпринимают трафик ПОСТОЯННО" as ING2
+  queue "Kafka (локальная)\n<size:10>3 брокера" as K2
+  database "ClickHouse\n<size:10>только агрегаты, 1 шард x RF2" as CH2
+  database "PostgreSQL\n<size:10>async DR-реплика, nofailover=true" as PG2
+}
+
+cloud "**Object Storage (гео-реплицируемое)**\n<size:10>raw archive 30 дней — источник для полного пересчёта;\ncold-партиции ClickHouse; checkpoint'ы Flink" as S3
+
+SDK --> GSLB
+GSLB --> ING1 : ~90% трафика
+GSLB --> ING2 : ~10% трафика\n<size:10>постоянно, чтобы путь был проверен
+ING1 --> K1
+ING2 --> K2
+K2 --> K1 : MirrorMaker 2\n<size:10>async, трансляция офсетов
+K1 --> F1
+K1 --> KC1
+KC1 --> S3
+F1 --> CH1
+F1 ..> S3 : checkpoint
+CH1 --> CH2 : репликация\nтолько агрегатов
+PG1 --> PG2 : async WAL, RPO ≤ 60 с
+CH1 <--> S3
+S3 ..> CH2 : пересчёт при DR
+
+note bottom of SDK
+  **Главный механизм надёжности приёма — на клиенте.**
+  Персистентная очередь в SQLite, экспоненциальный backoff с jitter,
+  дожитие событий до 7 суток. Полная недоступность приёма до 1 часа
+  не приводит к потере данных — только к всплеску после восстановления.
+  Всплеск гасит Kafka (запас по полосе десятикратный, retention 72 ч),
+  а разбирает его Flink с заложенным запасом параллелизма x1,5.
+end note
+
+note right of S3
+  **ClickHouse — производное хранилище.**
+  Худший сценарий (потеря всех шардов) не означает потерю данных:
+  детальные события за 30 дней пересчитываются из raw archive,
+  более старые — из суточных агрегатов, которые реплицируются в DR.
+  Измеренная скорость пересчёта — 4 часа на 30 дней при удвоенном
+  параллелизме Flink; это и есть RTO худшего случая.
+end note
+
+legend right
+  **Приём: active-active.** Оба региона принимают события постоянно —
+  DR-путь проверяется боевым трафиком, а не раз в полгода на учениях.
+
+  **Аналитика: active-passive.** Держать второй полный ClickHouse
+  дороже, чем пережить 30 минут без детальных отчётов:
+  в DR-режиме доступны только агрегаты за 3 года.
+
+  **Целевые показатели:** приём RTO 1 мин / RPO 0;
+  аналитика RTO 30 мин / RPO 15 мин; DR региона RTO 30 мин.
+endlegend
+
+@enduml

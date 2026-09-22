@@ -1,0 +1,59 @@
+@startuml c4-context
+title C4 уровень 1 (System Context) — платформа телеметрии мобильных приложений
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 12
+skinparam rectangle {
+  BorderColor #3A5A8C
+  FontColor #1B2A41
+}
+skinparam actor {
+  BorderColor #5B6B7A
+}
+left to right direction
+
+actor "Конечный пользователь\nмобильного приложения" as EU #line:9AA5B1
+actor "Разработчик / аналитик\nклиента" as AN
+actor "Владелец приложения\n(админ аккаунта)" as OWN
+actor "SRE платформы" as SRE
+
+rectangle "**Мобильное приложение клиента**\n<size:10>iOS / Android / Flutter\nсо встроенным Telemetry SDK" as APP #E8F0FB
+rectangle "**CI/CD клиента**\n<size:10>сборка приложения" as CI #E8F0FB
+
+rectangle "==Платформа телеметрии==\n<size:11>Приём, обработка, хранение и анализ\nсобытий и отчётов о сбоях\nс мобильных приложений.\nMulti-tenant SaaS." as SYS #D6E4F7
+
+rectangle "**GeoIP-провайдер**\n<size:10>MaxMind GeoLite2" as GEO #F2F2F2
+rectangle "**IdP клиента**\n<size:10>SAML / OIDC (корпоративный SSO)" as IDP #F2F2F2
+rectangle "**Платёжный провайдер**\n<size:10>подписки и тарифные планы" as PSP #F2F2F2
+rectangle "**Device Attestation**\n<size:10>Play Integrity / App Attest" as ATT #F2F2F2
+rectangle "**Объектное хранилище клиента**\n<size:10>S3 / GCS — выгрузка сырых событий" as CS3 #F2F2F2
+rectangle "**Каналы оповещения**\n<size:10>Slack, Telegram, e-mail, вебхуки" as CH #F2F2F2
+
+EU --> APP : пользуется\nприложением
+APP --> SYS : батчи событий и отчёты о сбоях\n<size:10>HTTPS/JSON, gzip, at-least-once
+SYS --> APP : конфигурация сбора\n<size:10>частота отправки, сэмплирование,\nсписок разрешённых событий
+
+CI --> SYS : загрузка символов\n<size:10>dSYM / ProGuard mapping
+
+AN --> SYS : дашборды, воронки,\nретеншн, разбор сбоев\n<size:10>HTTPS / Web UI
+OWN --> SYS : приложения, API-ключи,\nучастники, квоты, тариф
+SRE --> SYS : эксплуатация\n<size:10>метрики, алерты, runbook
+
+SYS --> GEO : обновление базы\n<size:10>раз в неделю, офлайн
+SYS --> IDP : аутентификация\nсотрудников клиента
+SYS --> PSP : списание по подписке\n<size:10>по счётчику событий
+SYS --> ATT : проверка подлинности\nустройства (опция)
+SYS --> CS3 : суточная выгрузка\nсырых событий
+SYS --> CH : алерты клиента\n<size:10>всплеск сбоев, исчерпание квоты
+
+legend right
+  |= Обозначение |= Значение |
+  | <#D6E4F7> | проектируемая система |
+  | <#E8F0FB> | системы клиента |
+  | <#F2F2F2> | внешние системы |
+  Конечный пользователь не взаимодействует с платформой напрямую:
+  источник данных — SDK внутри приложения клиента.
+endlegend
+
+@enduml

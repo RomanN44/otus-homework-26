@@ -1,0 +1,85 @@
+@startuml sharding
+title Шардирование: Kafka по (app_id, device_bucket), ClickHouse по app_id с двухуровневой маршрутизацией
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 11
+skinparam componentStyle rectangle
+
+component "**Ingest Gateway**\n<size:10>ключ Kafka = app_id ~+ ~: ~+ (hash(device_id) % sub(app_id))\nsub = 1 для обычных приложений,\nsub = 64 для крупных" as ING
+
+package "Kafka — events.raw.v1, 96 партиций, RF=3" #FFF6E8 {
+  queue "p0..p31\n<size:10>мелкие приложения" as P1
+  queue "p32..p63\n<size:10>мелкие приложения" as P2
+  queue "p64..p95\n<size:10>крупные приложения\n(64 субключа каждое)" as P3
+}
+
+component "**Enrichment (Flink)**\n<size:10>параллелизм 48, keyBy(device_id)" as ENR
+
+package "Routing" #F0F0F0 {
+  component "**Shard router**\n<size:10>tier = lookup(app_id)\n\nSMALL: shard = map[crc32(app_id) % 1024]\nLARGE: shard = crc32(app_id, device_id) % N" as ROUTER
+  database "**Карта бакетов**\n<size:10>bucket → shard, tier приложения.\nИсточник: PostgreSQL → ClickHouse Keeper,\nкэш в Redis" as MAP
+}
+
+package "ClickHouse — 6 шардов x RF2 = 12 узлов" #FDECEC {
+  database "shard 0\n<size:10>buckets 0..170\n+ реплика в AZ-B" as S0
+  database "shard 1\n<size:10>buckets 171..341" as S1
+  database "shard 2\n<size:10>buckets 342..512" as S2
+  database "shard 3..5\n<size:10>buckets 513..1023" as S3
+}
+
+cloud "**S3**\n<size:10>cold-диск ClickHouse:\nпартиции старше 30 дней" as S3C
+
+ING --> P1
+ING --> P2
+ING --> P3
+P1 --> ENR
+P2 --> ENR
+P3 --> ENR
+ENR --> ROUTER
+ROUTER ..> MAP : читает карту
+ROUTER --> S0
+ROUTER --> S1
+ROUTER --> S2
+ROUTER --> S3
+S0 <--> S3C
+S1 <--> S3C
+
+note right of S0
+  **Внутри шарда**
+  ENGINE = ReplicatedReplacingMergeTree(ingested_at)
+  PARTITION BY toYYYYMMDD(event_time)
+  ORDER BY (app_id, event_name, event_time,
+            cityHash64(user_id), event_id)
+  TTL event_time + 30d TO DISK 's3',
+      event_time + 90d DELETE
+end note
+
+note bottom of ROUTER
+  **Почему два уровня**
+
+  SMALL (99,5% приложений): все данные приложения в одном шарде.
+  Любой отчёт — локальный запрос к одному шарду, никакого scatter-gather.
+
+  LARGE (топ-10 приложений, 30% потока): 30 дней данных такого
+  приложения — до 2,7 млрд строк. Один шард (16 ядер, ~50 млн строк/с
+  на воронке) обработал бы их за ~54 с при бюджете НФТ 10 с.
+  Данные размазываются по всем шардам ключом (app_id, device_id):
+  scatter-gather, зато 96 ядер и ~9 с.
+  Ограничение — параллелизм запроса, а не место на диске.
+  Порог перевода в LARGE — 20 млн событий в сутки, решение
+  принимает Control Plane, переезд — фоновой перезаливкой из S3-архива.
+end note
+
+legend right
+  **Kafka.** Порядок нужен только в пределах устройства (сессионизация),
+  поэтому ключ содержит device_bucket. Чистый app_id как ключ дал бы
+  горячую партицию: один клиент = 30% потока.
+
+  **ClickHouse.** Ключ — app_id, потому что межприложенческих запросов
+  в продукте нет: каждый клиент видит только свои данные.
+  Границы шардов — через 1024 логических бакета, а не hash % N:
+  добавление 7-го шарда переселяет ~14% бакетов, ключ не меняется.
+endlegend
+
+@enduml
